@@ -48,7 +48,7 @@ Node names may be passed with or without a leading `/`. Stop with Ctrl+C when `-
 | `timestamp` | Local time with milliseconds |
 | `system_cpu_avg_pct` | Average CPU across all cores |
 | `system_gpu_pct` | GPU load (%) |
-| `system_ram_pct` | System RAM usage (%) |
+| `system_ram_GB` | System RAM used (GB) |
 | `system_cores_above_{x}pct` | Cores with usage > `x` |
 
 ### Per target process
