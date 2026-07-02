@@ -1,6 +1,8 @@
 # Jetson CPU/GPU Monitor
 
-Log CPU and GPU usage to an Excel file. CPU sampling uses `psutil.cpu_percent(interval=0, percpu=True)`.
+Log system and per-process resource usage to an Excel file.
+
+CPU/RAM use `psutil`. GPU load on Jetson is read from sysfs (`value / 10` = percent, system-wide only).
 
 ## Install
 
@@ -8,14 +10,19 @@ Log CPU and GPU usage to an Excel file. CPU sampling uses `psutil.cpu_percent(in
 pip install -r requirements.txt
 ```
 
-For the optional GPU stress utility, CUDA `nvcc` must be available
-(`/usr/local/cuda/bin`).
-
-## Monitor
+## Usage
 
 ```bash
-python3 monitor.py --hz 10 --threshold 80 --duration 60 -o output.xlsx
+python3 monitor.py --hz 50 \
+  --threshold 90 \
+  --duration 60 \
+  --target-processes my_node another_node \
+  -o output.xlsx
 ```
+
+Node names may be passed with or without a leading `/`. Stop with Ctrl+C when `--duration 0` (default).
+
+## Arguments
 
 | Argument | Default | Description |
 |----------|---------|-------------|
@@ -23,21 +30,45 @@ python3 monitor.py --hz 10 --threshold 80 --duration 60 -o output.xlsx
 | `-x`, `--threshold` | `80` | Count CPU cores above this usage (%) |
 | `--duration` | `0` | Run time in seconds (`0` = until Ctrl+C) |
 | `-o`, `--output` | auto timestamp | Output `.xlsx` path |
+| `--target-processes` | _(none)_ | ROS2 node name(s) to track (CPU + RAM each) |
 
-### Excel columns
+## Excel output
+
+| Row | Content |
+|-----|---------|
+| 1 | `RUN_PARAMS` — command settings used for the run |
+| 2 | Column headers |
+| 3…n | Samples |
+| Last | `SUMMARY` — average for `*_pct` / `*_gb`, sum for `system_cores_above_*` |
+
+### System columns
 
 | Column | Description |
 |--------|-------------|
 | `timestamp` | Local time with milliseconds |
-| `cpu_avg_pct` | Average CPU usage across all cores |
-| `gpu_pct` | Jetson GPU load from sysfs (`/10`) |
-| `cores_above_{x}pct` | Number of cores with usage > `x` |
+| `system_cpu_avg_pct` | Average CPU across all cores |
+| `system_gpu_pct` | GPU load (%) |
+| `system_ram_pct` | System RAM usage (%) |
+| `system_cores_above_{x}pct` | Cores with usage > `x` |
 
-## GPU stress (for testing)
+### Per target process
+
+For each name in `--target-processes`:
+
+| Column | Description |
+|--------|-------------|
+| `{name}_cpu_avg_pct` | Process CPU (%) |
+| `{name}_ram_gb` | Process RSS (GB) |
+
+PIDs are found by matching `__node:=<name>` in the process cmdline.
+
+## GPU stress (optional)
 
 ```bash
 python3 gpu_stress.py
 ```
+
+Requires CUDA `nvcc` for the bundled CUDA utility.
 
 ## Quick test
 
