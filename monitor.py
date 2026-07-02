@@ -4,7 +4,7 @@ Log CPU and GPU usage to an Excel file on Jetson (or any Linux host with psutil)
 
 CPU sampling follows main_controller/observer.py:
   psutil.cpu_percent(interval=0, percpu=True)
-  psutil.virtual_memory().percent
+  psutil.virtual_memory().used
 
 GPU load is read from Jetson sysfs (value / 10 = percent).
 """
@@ -69,9 +69,8 @@ def get_cpu_per_core() -> list[float]:
     return list(psutil.cpu_percent(interval=0, percpu=True))
 
 
-def get_ram_percent() -> float:
-    """Same metric as main_controller/observer.py: psutil.virtual_memory().percent."""
-    return psutil.virtual_memory().percent
+def get_system_ram_gb() -> float:
+    return psutil.virtual_memory().used / (1024**3)
 
 
 def count_cores_above(per_core: list[float], threshold: float) -> int:
@@ -119,7 +118,7 @@ def build_columns(threshold: float, target_processes: list[str]) -> list[str]:
         "timestamp",
         "system_cpu_avg_pct",
         "system_gpu_pct",
-        "system_ram_pct",
+        "system_ram_gb",
         cores_col,
     ]
     for name in target_processes:
@@ -244,7 +243,7 @@ def build_summary_row(columns: list[str], rows: list[dict[str, object]]) -> list
             )
         elif column.startswith("system_cores_above_"):
             summary.append(sum(int(value) for value in values))
-        elif column.endswith("_pct") or column.endswith("_gb") or column == "system_ram_pct":
+        elif column.endswith("_pct") or column.endswith("_gb"):
             summary.append(
                 round(statistics.fmean(float(value) for value in values), 3)
                 if column.endswith("_gb")
@@ -344,7 +343,7 @@ def main() -> int:
                 "timestamp": timestamp,
                 "system_cpu_avg_pct": statistics.fmean(per_core) if per_core else 0.0,
                 "system_gpu_pct": read_gpu_percent(gpu_load_path),
-                "system_ram_pct": get_ram_percent(),
+                "system_ram_gb": get_system_ram_gb(),
                 system_cores_col: count_cores_above(per_core, args.threshold),
             }
 
@@ -364,7 +363,7 @@ def main() -> int:
                 line = (
                     f"[{timestamp}] system_cpu={float(row['system_cpu_avg_pct']):.1f}% "
                     f"system_gpu={gpu_text}% "
-                    f"system_ram={float(row['system_ram_pct']):.1f}% "
+                    f"system_ram={float(row['system_ram_gb']):.3f}GB "
                     f"{system_cores_col}={row[system_cores_col]}"
                 )
                 for name in target_processes:
@@ -391,7 +390,7 @@ def main() -> int:
         print(
             "Summary row: "
             f"system_cpu_avg_pct={summary_map['system_cpu_avg_pct']}% "
-            f"system_ram_pct={summary_map['system_ram_pct']}% "
+            f"system_ram_gb={summary_map['system_ram_gb']} "
             f"{system_cores_col}={summary_map[system_cores_col]}"
         )
         for name in target_processes:
