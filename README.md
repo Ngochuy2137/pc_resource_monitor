@@ -1,6 +1,6 @@
-# Jetson CPU/GPU Monitor
+# PC Resource Monitor
 
-Log system and per-process resource usage to an Excel file.
+Log system and per-process resource usage (CPU/RAM/GPU) to an Excel file.
 
 CPU/RAM use `psutil`. GPU load on Jetson is read from sysfs (`value / 10` = percent, system-wide only).
 
