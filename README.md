@@ -1,4 +1,4 @@
-# Jetson Resource Monitor
+# Jetson CPU/GPU Monitor
 
 Log system and per-process resource usage to an Excel file.
 
@@ -48,7 +48,7 @@ Node names may be passed with or without a leading `/`. Stop with Ctrl+C when `-
 | `timestamp` | Local time with milliseconds |
 | `system_cpu_avg_pct` | Average CPU across all cores |
 | `system_gpu_pct` | GPU load (%) |
-| `system_ram_GB` | System RAM used (GB) |
+| `system_ram_gb` | System RAM used (GB) |
 | `system_cores_above_{x}pct` | Cores with usage > `x` |
 
 ### Per target process
@@ -57,10 +57,14 @@ For each name in `--target-processes`:
 
 | Column | Description |
 |--------|-------------|
-| `{name}_cpu_avg_pct` | Process CPU (%) |
+| `{name}_cpu_avg_pct` | Process CPU (%) on the same scale as `system_cpu_avg_pct` |
 | `{name}_ram_gb` | Process RSS (GB) |
 
 PIDs are found by matching `__node:=<name>` in the process cmdline.
+
+Target process CPU is `psutil` process utilization divided by `cpu_count`, so it is
+comparable to `system_cpu_avg_pct` (average load across all cores). GPU work is not
+included in process CPU.
 
 ## GPU stress (optional)
 

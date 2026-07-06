@@ -34,6 +34,9 @@ DEFAULT_GPU_LOAD_PATHS = (
     "/sys/devices/platform/bus@0/17000000.gpu/load",
     "/sys/class/devfreq/17000000.gpu/device/load",
 )
+DEFAULT_PID_REFRESH_INTERVAL_S = 2.0
+PACKAGE_DIR = Path(__file__).resolve().parent
+LOGS_DIR = PACKAGE_DIR / "logs"
 
 
 def find_gpu_load_path() -> Path | None:
@@ -63,6 +66,15 @@ def read_gpu_percent(gpu_load_path: Path | None) -> float | None:
         return float(raw) / 10.0
     except (OSError, ValueError):
         return None
+
+
+def get_cpu_count() -> int:
+    return psutil.cpu_count() or 1
+
+
+def normalize_process_cpu_to_system_scale(process_cpu_pct: float) -> float:
+    """Convert psutil process CPU (% of one core) to system-avg scale."""
+    return process_cpu_pct / get_cpu_count()
 
 
 def get_cpu_per_core() -> list[float]:
@@ -108,6 +120,65 @@ def find_pids_by_ros2_node(node_name: str) -> list[int]:
     return find_pids_by_cmdline(ros2_node_to_process_match(node_name))
 
 
+def find_pids_for_ros2_nodes(node_names: list[str]) -> dict[str, list[int]]:
+    """Resolve all target nodes in a single process scan."""
+    if not node_names:
+        return {}
+
+    fragments = {
+        name: ros2_node_to_process_match(name).lower() for name in node_names
+    }
+    pids_by_name = {name: [] for name in node_names}
+    own_pid = os.getpid()
+
+    for proc in psutil.process_iter(["pid", "cmdline", "exe"]):
+        pid = proc.info["pid"]
+        if pid == own_pid:
+            continue
+        cmdline = " ".join(proc.info["cmdline"] or [])
+        cmdline_lower = cmdline.lower()
+        exe = (proc.info["exe"] or "").lower()
+        if exe.endswith("/bash") or exe.endswith("/sh"):
+            continue
+        for name, fragment in fragments.items():
+            if fragment in cmdline_lower:
+                if pid not in pids_by_name[name]:
+                    pids_by_name[name].append(pid)
+
+    return pids_by_name
+
+
+class TargetPidTracker:
+    """Cache ROS2 node PIDs; refresh periodically or after a stale PID."""
+
+    def __init__(
+        self,
+        target_processes: list[str],
+        refresh_interval_s: float = DEFAULT_PID_REFRESH_INTERVAL_S,
+    ) -> None:
+        self.target_processes = target_processes
+        self.refresh_interval_s = refresh_interval_s
+        self.pids_by_name: dict[str, list[int]] = {
+            name: [] for name in target_processes
+        }
+        self.last_refresh = 0.0
+        self._force_refresh = True
+
+    def refresh(self) -> dict[str, list[int]]:
+        self.pids_by_name = find_pids_for_ros2_nodes(self.target_processes)
+        self.last_refresh = time.monotonic()
+        self._force_refresh = False
+        return self.pids_by_name
+
+    def get_pids(self, now: float) -> dict[str, list[int]]:
+        if self._force_refresh or (now - self.last_refresh) >= self.refresh_interval_s:
+            self.refresh()
+        return self.pids_by_name
+
+    def invalidate(self) -> None:
+        self._force_refresh = True
+
+
 def normalize_target_processes(names: list[str]) -> list[str]:
     return [normalize_ros2_node_name(name) for name in names if name.strip()]
 
@@ -127,12 +198,53 @@ def build_columns(threshold: float, target_processes: list[str]) -> list[str]:
     return columns
 
 
+# Per-PID baseline: (cpu_time_seconds, monotonic_timestamp)
+ProcessCpuBaseline = tuple[float, float]
+
+
+def read_process_cpu_pct(
+    pid: int,
+    proc: psutil.Process,
+    baselines: dict[int, ProcessCpuBaseline],
+    min_read_interval_s: float,
+) -> float | None:
+    """CPU usage (% of one core) from cpu_times delta; None = skip this sample."""
+    read_now = time.monotonic()
+    times = proc.cpu_times()
+    cpu_sec = times.user + times.system
+
+    if pid not in baselines:
+        baselines[pid] = (cpu_sec, read_now)
+        return None
+
+    prev_cpu, prev_t = baselines[pid]
+    delta_t = read_now - prev_t
+    if delta_t < min_read_interval_s:
+        return None
+
+    delta_cpu = cpu_sec - prev_cpu
+    if delta_cpu < 0:
+        baselines[pid] = (cpu_sec, read_now)
+        return None
+
+    baselines[pid] = (cpu_sec, read_now)
+    raw_pct = (delta_cpu / delta_t) * 100.0
+    # One process cannot exceed 100% x cpu_count on the per-core scale.
+    if raw_pct > get_cpu_count() * 100.0:
+        return None
+    return raw_pct
+
+
 def sample_process_resource(
     pids: list[int],
     process_cache: dict[int, psutil.Process],
-) -> tuple[float, float]:
+    cpu_baselines: dict[int, ProcessCpuBaseline],
+    min_read_interval_s: float,
+) -> tuple[float, float, bool]:
     cpu_total = 0.0
     ram_gb = 0.0
+    stale_pid = False
+    got_reading = False
 
     for pid in pids:
         try:
@@ -140,19 +252,30 @@ def sample_process_resource(
             if proc is None:
                 proc = psutil.Process(pid)
                 process_cache[pid] = proc
-                proc.cpu_percent(interval=None)
-                continue
-            cpu_total += proc.cpu_percent(interval=None)
+
+            cpu_pct = read_process_cpu_pct(
+                pid, proc, cpu_baselines, min_read_interval_s
+            )
+            if cpu_pct is not None:
+                cpu_total += cpu_pct
+                got_reading = True
             ram_gb += proc.memory_info().rss / (1024**3)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             process_cache.pop(pid, None)
+            cpu_baselines.pop(pid, None)
+            stale_pid = True
             continue
-    return cpu_total, ram_gb
+
+    if not got_reading:
+        cpu_total = 0.0
+    return normalize_process_cpu_to_system_scale(cpu_total), ram_gb, stale_pid
 
 
-def prime_process_cpu_counters(
+def init_cpu_baselines(
     pids: list[int],
     process_cache: dict[int, psutil.Process],
+    cpu_baselines: dict[int, ProcessCpuBaseline],
+    now: float,
 ) -> None:
     for pid in pids:
         try:
@@ -160,15 +283,75 @@ def prime_process_cpu_counters(
             if proc is None:
                 proc = psutil.Process(pid)
                 process_cache[pid] = proc
-            proc.cpu_percent(interval=None)
+            times = proc.cpu_times()
+            cpu_baselines[pid] = (times.user + times.system, now)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             process_cache.pop(pid, None)
-            continue
+            cpu_baselines.pop(pid, None)
+
+
+def evict_untracked_pids(
+    pids_by_name: dict[str, list[int]],
+    process_cache: dict[int, psutil.Process],
+    cpu_baselines: dict[int, ProcessCpuBaseline],
+) -> None:
+    tracked = set()
+    for pids in pids_by_name.values():
+        tracked.update(pids)
+    for pid in list(process_cache):
+        if pid not in tracked:
+            process_cache.pop(pid, None)
+            cpu_baselines.pop(pid, None)
+
+
+def format_elapsed_prefix(elapsed_s: float, duration_s: float) -> str:
+    if duration_s > 0:
+        return f"[{elapsed_s:.1f}/{duration_s:g}]"
+    return f"[{elapsed_s:.1f}s]"
+
+
+def format_status_line(
+    row: dict[str, object],
+    elapsed_s: float,
+    duration_s: float,
+    system_cores_col: str,
+    target_processes: list[str],
+) -> str:
+    gpu_pct = row["system_gpu_pct"]
+    gpu_text = "n/a" if gpu_pct is None else f"{float(gpu_pct):.1f}"
+    line = (
+        f"{format_elapsed_prefix(elapsed_s, duration_s)} "
+        f"system_cpu={float(row['system_cpu_avg_pct']):.1f}% "
+        f"system_gpu={gpu_text}% "
+        f"system_ram={float(row['system_ram_gb']):.3f}GB "
+        f"{system_cores_col}={row[system_cores_col]}"
+    )
+    for name in target_processes:
+        line += (
+            f" {name}_cpu={float(row[f'{name}_cpu_avg_pct']):.1f}%"
+            f" {name}_ram={float(row[f'{name}_ram_gb']):.3f}GB"
+        )
+    return line
+
+
+def print_status_line(line: str) -> None:
+    print("\r" + line, end="", flush=True)
 
 
 def default_output_path() -> Path:
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return Path(__file__).resolve().parent / f"cpu_gpu_monitor_{stamp}.xlsx"
+    return LOGS_DIR / f"cpu_gpu_monitor_{stamp}.xlsx"
+
+
+def resolve_output_path(user_path: Path | None) -> Path:
+    if user_path is None:
+        return default_output_path()
+    if user_path.is_absolute():
+        user_path.parent.mkdir(parents=True, exist_ok=True)
+        return user_path
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    return LOGS_DIR / user_path
 
 
 def parse_args() -> argparse.Namespace:
@@ -199,7 +382,7 @@ def parse_args() -> argparse.Namespace:
         "--output",
         type=Path,
         default=None,
-        help="Output .xlsx path (default: cpu_gpu_monitor_<timestamp>.xlsx in package dir)",
+        help="Output .xlsx path (default: logs/cpu_gpu_monitor_<timestamp>.xlsx)",
     )
     parser.add_argument(
         "--target-processes",
@@ -219,6 +402,8 @@ def parse_args() -> argparse.Namespace:
 def round_cell(column: str, value: object) -> object:
     if column == "timestamp":
         return value
+    if value is None:
+        return None
     if column.endswith("_pct"):
         return round(float(value), 2)
     if column.endswith("_gb"):
@@ -272,9 +457,12 @@ def main() -> int:
     system_cores_col = f"system_cores_above_{args.threshold:g}pct"
 
     interval = 1.0 / args.hz
-    output_path = args.output or default_output_path()
+    output_path = resolve_output_path(args.output)
     gpu_load_path = find_gpu_load_path()
     process_cache: dict[int, psutil.Process] = {}
+    cpu_baselines: dict[int, ProcessCpuBaseline] = {}
+    pid_tracker = TargetPidTracker(target_processes)
+    min_read_interval_s = interval * 0.75
 
     if gpu_load_path is None:
         print("Warning: GPU load sysfs not found; GPU column will be empty.", file=sys.stderr)
@@ -282,8 +470,12 @@ def main() -> int:
         print(f"GPU load path: {gpu_load_path}")
 
     psutil.cpu_percent(interval=0, percpu=True)
+    prime_time = time.monotonic()
+    initial_pids = pid_tracker.refresh()
     for name in target_processes:
-        prime_process_cpu_counters(find_pids_by_ros2_node(name), process_cache)
+        init_cpu_baselines(
+            initial_pids.get(name, []), process_cache, cpu_baselines, prime_time
+        )
 
     workbook = Workbook()
     sheet = workbook.active
@@ -306,26 +498,46 @@ def main() -> int:
 
     rows: list[dict[str, object]] = []
     start = time.monotonic()
-    next_sample = start
+    next_sample = start + interval
     sample_count = 0
 
     print(
         f"Sampling at {args.hz:g} Hz, threshold={args.threshold:g}%%, "
-        f"output={output_path}"
+        f"cpu_count={get_cpu_count()}, output={output_path}"
     )
+    if target_processes:
+        print(
+            "Target process CPU uses the same scale as system_cpu_avg_pct "
+            "(cpu_times delta / elapsed / cpu_count)."
+        )
     for name in target_processes:
-        pids = find_pids_by_ros2_node(name)
+        pids = initial_pids.get(name, [])
         if pids:
             print(
                 f"Tracking '/{name}': "
                 f"cmdline match '{ros2_node_to_process_match(name)}', PIDs={pids}"
             )
+            if len(pids) > 1:
+                print(
+                    f"Warning: multiple PIDs matched '/{name}'; "
+                    "CPU is summed across all matches.",
+                    file=sys.stderr,
+                )
         else:
             print(
                 f"Warning: no process matched '/{name}'; "
                 "its columns will stay empty until a match appears.",
                 file=sys.stderr,
             )
+    if target_processes:
+        print(
+            f"PID cache: refresh every {DEFAULT_PID_REFRESH_INTERVAL_S:g}s "
+            "or immediately after node restart."
+        )
+        print(
+            "Process CPU scale: 0-100% = share of total system CPU "
+            f"(cpu_times delta / elapsed / {get_cpu_count()} cores)."
+        )
 
     try:
         while True:
@@ -338,6 +550,7 @@ def main() -> int:
                 continue
 
             per_core = get_cpu_per_core()
+            elapsed_s = now - start
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
             row: dict[str, object] = {
                 "timestamp": timestamp,
@@ -347,33 +560,37 @@ def main() -> int:
                 system_cores_col: count_cores_above(per_core, args.threshold),
             }
 
+            current_pids = pid_tracker.get_pids(now)
+            evict_untracked_pids(current_pids, process_cache, cpu_baselines)
             for name in target_processes:
-                pids = find_pids_by_ros2_node(name)
-                cpu_pct, ram_gb = sample_process_resource(pids, process_cache)
+                pids = current_pids.get(name, [])
+                cpu_pct, ram_gb, stale_pid = sample_process_resource(
+                    pids,
+                    process_cache,
+                    cpu_baselines,
+                    min_read_interval_s,
+                )
+                if stale_pid:
+                    pid_tracker.invalidate()
                 row[f"{name}_cpu_avg_pct"] = cpu_pct
                 row[f"{name}_ram_gb"] = ram_gb
 
             rows.append(row)
             sample_count += 1
-            next_sample += interval
+            # Resync when behind; do not catch up missed ticks (burst breaks
+            # process cpu_percent(interval=None) which needs real elapsed time).
+            next_sample = now + interval
 
             if sample_count % int(max(args.hz, 1)) == 0:
-                gpu_pct = row["system_gpu_pct"]
-                gpu_text = "n/a" if gpu_pct is None else f"{float(gpu_pct):.1f}"
-                line = (
-                    f"[{timestamp}] system_cpu={float(row['system_cpu_avg_pct']):.1f}% "
-                    f"system_gpu={gpu_text}% "
-                    f"system_ram={float(row['system_ram_gb']):.3f}GB "
-                    f"{system_cores_col}={row[system_cores_col]}"
-                )
-                for name in target_processes:
-                    line += (
-                        f" {name}_cpu={float(row[f'{name}_cpu_avg_pct']):.1f}%"
-                        f" {name}_ram={float(row[f'{name}_ram_gb']):.3f}GB"
+                print_status_line(
+                    format_status_line(
+                        row, elapsed_s, args.duration, system_cores_col, target_processes
                     )
-                print(line)
+                )
     except KeyboardInterrupt:
         print("\nStopped by user.")
+    else:
+        print()
 
     for row in rows:
         sheet.append([round_cell(column, row[column]) for column in columns])
