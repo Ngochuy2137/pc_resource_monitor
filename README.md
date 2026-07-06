@@ -4,6 +4,12 @@ Log system and per-process resource usage (CPU/RAM/GPU) to an Excel file.
 
 CPU/RAM use `psutil`. GPU load on Jetson is read from sysfs (`value / 10` = percent, system-wide only).
 
+![Screenshot](./media/image1.png)
+<!-- <p align="center">
+  <img src="./media/image1.png" alt="Image 1" width="45%">
+  <img src="./media/image2.png" alt="Image 2" width="45%">
+</p> -->
+
 ## Install
 
 ```bash
