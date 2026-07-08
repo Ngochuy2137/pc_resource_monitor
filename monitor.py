@@ -89,13 +89,13 @@ def count_cores_above(per_core: list[float], threshold: float) -> int:
     return sum(1 for value in per_core if value > threshold)
 
 
-def find_pids_by_cmdline(fragment: str) -> list[int]:
+def find_pids_by_cmdline(fragment: str, *, include_self: bool = True) -> list[int]:
     fragment_lower = fragment.lower()
     own_pid = os.getpid()
     pids: list[int] = []
     for proc in psutil.process_iter(["pid", "cmdline", "exe"]):
         pid = proc.info["pid"]
-        if pid == own_pid:
+        if pid == own_pid and not include_self:
             continue
         cmdline = " ".join(proc.info["cmdline"] or [])
         if fragment_lower not in cmdline.lower():
@@ -116,36 +116,79 @@ def ros2_node_to_process_match(node_name: str) -> str:
     return f"__node:={normalize_ros2_node_name(node_name)}"
 
 
+SELF_PROCESS_ALIAS = "self"
+
+
+def is_self_process_alias(name: str) -> bool:
+    return normalize_ros2_node_name(name).lower() == SELF_PROCESS_ALIAS
+
+
+def match_fragments_for_target(name: str) -> list[str]:
+    """Cmdline substrings: ROS2 __node:=NAME, or script NAME.py (not bare NAME)."""
+    normalized = normalize_ros2_node_name(name)
+    fragments = [ros2_node_to_process_match(normalized)]
+    if not normalized.endswith(".py"):
+        fragments.append(f"{normalized}.py")
+    return fragments
+
+
 def find_pids_by_ros2_node(node_name: str) -> list[int]:
-    return find_pids_by_cmdline(ros2_node_to_process_match(node_name))
+    return find_pids_for_targets([node_name]).get(node_name, [])
 
 
-def find_pids_for_ros2_nodes(node_names: list[str]) -> dict[str, list[int]]:
-    """Resolve all target nodes in a single process scan."""
+def find_pids_for_targets(node_names: list[str]) -> dict[str, list[int]]:
+    """Resolve target PIDs in one process scan (ROS2 nodes, scripts, or self)."""
     if not node_names:
         return {}
 
-    fragments = {
+    ros2_fragments = {
         name: ros2_node_to_process_match(name).lower() for name in node_names
     }
+    script_fragments = {
+        name: f"{normalize_ros2_node_name(name)}.py".lower()
+        for name in node_names
+        if not normalize_ros2_node_name(name).endswith(".py")
+    }
     pids_by_name = {name: [] for name in node_names}
+    ros2_pids_by_name = {name: [] for name in node_names}
+    script_pids_by_name = {name: [] for name in node_names}
     own_pid = os.getpid()
+
+    for name in node_names:
+        if is_self_process_alias(name):
+            pids_by_name[name] = [own_pid]
 
     for proc in psutil.process_iter(["pid", "cmdline", "exe"]):
         pid = proc.info["pid"]
-        if pid == own_pid:
-            continue
         cmdline = " ".join(proc.info["cmdline"] or [])
         cmdline_lower = cmdline.lower()
         exe = (proc.info["exe"] or "").lower()
         if exe.endswith("/bash") or exe.endswith("/sh"):
             continue
-        for name, fragment in fragments.items():
-            if fragment in cmdline_lower:
-                if pid not in pids_by_name[name]:
-                    pids_by_name[name].append(pid)
+        for name in node_names:
+            if is_self_process_alias(name):
+                continue
+            if ros2_fragments[name] in cmdline_lower:
+                if pid not in ros2_pids_by_name[name]:
+                    ros2_pids_by_name[name].append(pid)
+            script_fragment = script_fragments.get(name)
+            if script_fragment and script_fragment in cmdline_lower:
+                if pid not in script_pids_by_name[name]:
+                    script_pids_by_name[name].append(pid)
+
+    for name in node_names:
+        if is_self_process_alias(name):
+            continue
+        if ros2_pids_by_name[name]:
+            pids_by_name[name] = ros2_pids_by_name[name]
+        else:
+            pids_by_name[name] = script_pids_by_name[name]
 
     return pids_by_name
+
+
+def find_pids_for_ros2_nodes(node_names: list[str]) -> dict[str, list[int]]:
+    return find_pids_for_targets(node_names)
 
 
 class TargetPidTracker:
@@ -235,11 +278,34 @@ def read_process_cpu_pct(
     return raw_pct
 
 
+def sample_single_pid(
+    pid: int,
+    process_cache: dict[int, psutil.Process],
+    cpu_baselines: dict[int, ProcessCpuBaseline],
+    min_read_interval_s: float,
+) -> tuple[float | None, float, bool]:
+    """Return (cpu_pct per-core scale or None, ram_gb, stale_pid)."""
+    try:
+        proc = process_cache.get(pid)
+        if proc is None:
+            proc = psutil.Process(pid)
+            process_cache[pid] = proc
+
+        cpu_pct = read_process_cpu_pct(pid, proc, cpu_baselines, min_read_interval_s)
+        ram_gb = proc.memory_info().rss / (1024**3)
+        return cpu_pct, ram_gb, False
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        process_cache.pop(pid, None)
+        cpu_baselines.pop(pid, None)
+        return None, 0.0, True
+
+
 def sample_process_resource(
     pids: list[int],
     process_cache: dict[int, psutil.Process],
     cpu_baselines: dict[int, ProcessCpuBaseline],
     min_read_interval_s: float,
+    pid_samples: dict[int, tuple[float | None, float]] | None = None,
 ) -> tuple[float, float, bool]:
     cpu_total = 0.0
     ram_gb = 0.0
@@ -247,28 +313,66 @@ def sample_process_resource(
     got_reading = False
 
     for pid in pids:
-        try:
-            proc = process_cache.get(pid)
-            if proc is None:
-                proc = psutil.Process(pid)
-                process_cache[pid] = proc
-
-            cpu_pct = read_process_cpu_pct(
-                pid, proc, cpu_baselines, min_read_interval_s
+        if pid_samples is not None and pid in pid_samples:
+            cpu_pct, pid_ram = pid_samples[pid]
+            stale_pid = False
+        else:
+            cpu_pct, pid_ram, stale_pid = sample_single_pid(
+                pid, process_cache, cpu_baselines, min_read_interval_s
             )
-            if cpu_pct is not None:
-                cpu_total += cpu_pct
-                got_reading = True
-            ram_gb += proc.memory_info().rss / (1024**3)
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            process_cache.pop(pid, None)
-            cpu_baselines.pop(pid, None)
-            stale_pid = True
+            if pid_samples is not None:
+                pid_samples[pid] = (cpu_pct, pid_ram)
+
+        if stale_pid:
             continue
+        if cpu_pct is not None:
+            cpu_total += cpu_pct
+            got_reading = True
+        ram_gb += pid_ram
 
     if not got_reading:
         cpu_total = 0.0
     return normalize_process_cpu_to_system_scale(cpu_total), ram_gb, stale_pid
+
+
+def sample_targets_for_tick(
+    target_processes: list[str],
+    pids_by_name: dict[str, list[int]],
+    process_cache: dict[int, psutil.Process],
+    cpu_baselines: dict[int, ProcessCpuBaseline],
+    min_read_interval_s: float,
+) -> tuple[dict[str, tuple[float, float]], bool]:
+    """Sample each unique PID once, then aggregate per target name."""
+    unique_pids: list[int] = []
+    seen: set[int] = set()
+    for name in target_processes:
+        for pid in pids_by_name.get(name, []):
+            if pid not in seen:
+                seen.add(pid)
+                unique_pids.append(pid)
+
+    pid_samples: dict[int, tuple[float | None, float]] = {}
+    stale_pid = False
+    for pid in unique_pids:
+        cpu_pct, ram_gb, pid_stale = sample_single_pid(
+            pid, process_cache, cpu_baselines, min_read_interval_s
+        )
+        pid_samples[pid] = (cpu_pct, ram_gb)
+        stale_pid = stale_pid or pid_stale
+
+    results: dict[str, tuple[float, float]] = {}
+    for name in target_processes:
+        pids = pids_by_name.get(name, [])
+        cpu_pct, ram_gb, name_stale = sample_process_resource(
+            pids,
+            process_cache,
+            cpu_baselines,
+            min_read_interval_s,
+            pid_samples=pid_samples,
+        )
+        results[name] = (cpu_pct, ram_gb)
+        stale_pid = stale_pid or name_stale
+    return results, stale_pid
 
 
 def init_cpu_baselines(
@@ -391,9 +495,9 @@ def parse_args() -> argparse.Namespace:
         default=None,
         metavar="NAME",
         help=(
-            "ROS2 node name(s) to track. Example: "
-            "--target-processes slam_toolbox_localization slam_toolbox_mapping. "
-            "PID is resolved from process cmdline __node:=NAME"
+            "Process or ROS2 node name(s) to track. Matches __node:=NAME, "
+            "cmdline substring, or NAME.py; use 'self' for this monitor process. "
+            "Example: --target-processes micro_ros_agent monitor self"
         ),
     )
     return parser.parse_args()
@@ -513,10 +617,14 @@ def main() -> int:
     for name in target_processes:
         pids = initial_pids.get(name, [])
         if pids:
-            print(
-                f"Tracking '/{name}': "
-                f"cmdline match '{ros2_node_to_process_match(name)}', PIDs={pids}"
-            )
+            if is_self_process_alias(name):
+                match_desc = f"alias '{SELF_PROCESS_ALIAS}' (this process)"
+            else:
+                match_desc = (
+                    "cmdline fragments: "
+                    + ", ".join(match_fragments_for_target(name))
+                )
+            print(f"Tracking '/{name}': {match_desc}, PIDs={pids}")
             if len(pids) > 1:
                 print(
                     f"Warning: multiple PIDs matched '/{name}'; "
@@ -562,16 +670,17 @@ def main() -> int:
 
             current_pids = pid_tracker.get_pids(now)
             evict_untracked_pids(current_pids, process_cache, cpu_baselines)
+            target_samples, stale_pid = sample_targets_for_tick(
+                target_processes,
+                current_pids,
+                process_cache,
+                cpu_baselines,
+                min_read_interval_s,
+            )
+            if stale_pid:
+                pid_tracker.invalidate()
             for name in target_processes:
-                pids = current_pids.get(name, [])
-                cpu_pct, ram_gb, stale_pid = sample_process_resource(
-                    pids,
-                    process_cache,
-                    cpu_baselines,
-                    min_read_interval_s,
-                )
-                if stale_pid:
-                    pid_tracker.invalidate()
+                cpu_pct, ram_gb = target_samples.get(name, (0.0, 0.0))
                 row[f"{name}_cpu_avg_pct"] = cpu_pct
                 row[f"{name}_ram_gb"] = ram_gb
 
