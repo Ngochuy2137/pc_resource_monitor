@@ -13,8 +13,10 @@ from __future__ import annotations
 import argparse
 import os
 import statistics
+import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -35,8 +37,29 @@ DEFAULT_GPU_LOAD_PATHS = (
     "/sys/class/devfreq/17000000.gpu/device/load",
 )
 DEFAULT_PID_REFRESH_INTERVAL_S = 2.0
+DEFAULT_SPIKE_TOP_N = 5
+DEFAULT_SPIKE_SAMPLE_S = 0.2
+DEFAULT_SPIKE_COOLDOWN_S = 5.0
 PACKAGE_DIR = Path(__file__).resolve().parent
 LOGS_DIR = PACKAGE_DIR / "logs"
+
+
+@dataclass(frozen=True)
+class ProcessCpuSnapshot:
+    rank: int
+    pid: int
+    name: str
+    cpu_pct: float
+    ram_mb: float
+    cmdline: str
+
+
+@dataclass(frozen=True)
+class CpuSpikeEvent:
+    timestamp: str
+    system_cpu_avg_pct: float
+    system_cores_above: int
+    top_processes: tuple[ProcessCpuSnapshot, ...]
 
 
 def find_gpu_load_path() -> Path | None:
@@ -230,13 +253,15 @@ def build_columns(threshold: float, target_processes: list[str]) -> list[str]:
     cores_col = f"system_cores_above_{threshold:g}pct"
     columns = [
         "timestamp",
-        "system_cpu_avg_pct",
-        "system_gpu_pct",
+        "system_cpu %",
+        "system_cpu_AVERAGE",
+        "system_gpu %",
+        "system_gpu_AVERAGE",
         "system_ram_gb",
         cores_col,
     ]
     for name in target_processes:
-        columns.append(f"{name}_cpu_avg_pct")
+        columns.append(f"{name}_cpu %")
         columns.append(f"{name}_ram_gb")
     return columns
 
@@ -408,6 +433,282 @@ def evict_untracked_pids(
             cpu_baselines.pop(pid, None)
 
 
+ProcessCpuTimesSample = tuple[float, str, str, float]
+
+
+def collect_process_cpu_times_samples(
+    *,
+    exclude_self: bool = True,
+) -> dict[int, ProcessCpuTimesSample]:
+    """One-shot sample of per-process cpu_times for spike ranking."""
+    own_pid = os.getpid()
+    samples: dict[int, ProcessCpuTimesSample] = {}
+    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+        pid = proc.info["pid"]
+        if exclude_self and pid == own_pid:
+            continue
+        try:
+            times = proc.cpu_times()
+            name = proc.info["name"] or "?"
+            cmdline_parts = proc.info["cmdline"] or []
+            cmdline = " ".join(cmdline_parts)[:200]
+            ram_mb = proc.memory_info().rss / (1024**2)
+            samples[pid] = (times.user + times.system, name, cmdline, ram_mb)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+    return samples
+
+
+def snapshot_top_processes_by_cpu_delta(
+    top_n: int,
+    sample_interval_s: float,
+    *,
+    exclude_self: bool = True,
+) -> list[ProcessCpuSnapshot]:
+    """
+    Rank processes by CPU over a short window. Only called on CPU spikes,
+    not on every monitor tick.
+    """
+    if top_n <= 0 or sample_interval_s <= 0:
+        return []
+
+    first = collect_process_cpu_times_samples(exclude_self=exclude_self)
+    time.sleep(sample_interval_s)
+    second = collect_process_cpu_times_samples(exclude_self=exclude_self)
+
+    cpu_count = get_cpu_count()
+    ranked: list[tuple[float, int, str, float, str]] = []
+    for pid, (cpu_sec, name, cmdline, ram_mb) in second.items():
+        first_sample = first.get(pid)
+        if first_sample is None:
+            continue
+        delta_cpu = cpu_sec - first_sample[0]
+        if delta_cpu < 0:
+            continue
+        cpu_pct = (delta_cpu / sample_interval_s) * 100.0 / cpu_count
+        if cpu_pct <= 0.01:
+            continue
+        ranked.append((cpu_pct, pid, name, ram_mb, cmdline))
+
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return [
+        ProcessCpuSnapshot(
+            rank=index + 1,
+            pid=pid,
+            name=name,
+            cpu_pct=cpu_pct,
+            ram_mb=ram_mb,
+            cmdline=cmdline,
+        )
+        for index, (cpu_pct, pid, name, ram_mb, cmdline) in enumerate(ranked[:top_n])
+    ]
+
+
+def snapshot_top_processes_via_pidstat(
+    top_n: int,
+    sample_interval_s: float,
+) -> list[ProcessCpuSnapshot] | None:
+    """Optional fast path using pidstat (sysstat). Returns None if unavailable."""
+    if top_n <= 0:
+        return []
+
+    count = max(1, int(round(sample_interval_s)))
+    try:
+        completed = subprocess.run(
+            ["pidstat", "-u", str(count), "1"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=sample_interval_s + 5.0,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+
+    if completed.returncode != 0 or not completed.stdout.strip():
+        return None
+
+    own_pid = os.getpid()
+    totals: dict[int, tuple[float, str]] = {}
+    for line in completed.stdout.splitlines():
+        if not line.startswith("  "):
+            continue
+        parts = line.split()
+        if len(parts) < 9 or parts[0] != "Average:":
+            continue
+        try:
+            pid = int(parts[2])
+            if pid == own_pid:
+                continue
+            cpu_pct = float(parts[7])
+            command = " ".join(parts[9:])[:200]
+        except (ValueError, IndexError):
+            continue
+        prev_cpu = totals.get(pid, (command, 0.0))[1]
+        totals[pid] = (command, prev_cpu + cpu_pct)
+
+    if not totals:
+        return None
+
+    ranked = sorted(totals.items(), key=lambda item: item[1][1], reverse=True)
+    snapshots: list[ProcessCpuSnapshot] = []
+    for index, (pid, (cmdline, cpu_pct)) in enumerate(ranked[:top_n]):
+        name = cmdline.split()[0] if cmdline else "?"
+        ram_mb = 0.0
+        try:
+            ram_mb = psutil.Process(pid).memory_info().rss / (1024**2)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+        snapshots.append(
+            ProcessCpuSnapshot(
+                rank=index + 1,
+                pid=pid,
+                name=name,
+                cpu_pct=cpu_pct,
+                ram_mb=ram_mb,
+                cmdline=cmdline,
+            )
+        )
+    return snapshots
+
+
+def capture_cpu_spike_top_processes(
+    top_n: int,
+    sample_interval_s: float,
+) -> list[ProcessCpuSnapshot]:
+    pidstat_result = snapshot_top_processes_via_pidstat(top_n, sample_interval_s)
+    if pidstat_result is not None:
+        return pidstat_result
+    return snapshot_top_processes_by_cpu_delta(top_n, sample_interval_s)
+
+
+class CpuSpikeDetector:
+    """Trigger a one-shot top-process snapshot only when CPU crosses a threshold."""
+
+    def __init__(
+        self,
+        threshold_pct: float,
+        top_n: int,
+        sample_interval_s: float,
+        cooldown_s: float,
+        *,
+        enabled: bool = True,
+    ) -> None:
+        self.threshold_pct = threshold_pct
+        self.top_n = top_n
+        self.sample_interval_s = sample_interval_s
+        self.cooldown_s = cooldown_s
+        self.enabled = enabled and threshold_pct > 0
+        self._above_threshold = False
+        self._last_capture = 0.0
+
+    def maybe_capture(
+        self,
+        *,
+        timestamp: str,
+        system_cpu_avg_pct: float,
+        system_cores_above: int,
+        now: float,
+    ) -> CpuSpikeEvent | None:
+        if not self.enabled:
+            return None
+
+        is_spike = system_cpu_avg_pct >= self.threshold_pct
+        if not is_spike:
+            self._above_threshold = False
+            return None
+
+        rising_edge = not self._above_threshold
+        cooldown_elapsed = (now - self._last_capture) >= self.cooldown_s
+        if not rising_edge and not cooldown_elapsed:
+            self._above_threshold = True
+            return None
+
+        self._above_threshold = True
+        self._last_capture = now
+        top_processes = tuple(
+            capture_cpu_spike_top_processes(self.top_n, self.sample_interval_s)
+        )
+        return CpuSpikeEvent(
+            timestamp=timestamp,
+            system_cpu_avg_pct=system_cpu_avg_pct,
+            system_cores_above=system_cores_above,
+            top_processes=top_processes,
+        )
+
+
+def format_spike_event(event: CpuSpikeEvent) -> str:
+    lines = [
+        (
+            f"CPU spike: system_cpu={event.system_cpu_avg_pct:.1f}% "
+            f"cores_above={event.system_cores_above} @ {event.timestamp}"
+        )
+    ]
+    if not event.top_processes:
+        lines.append("  (no process snapshot available)")
+        return "\n".join(lines)
+
+    for proc in event.top_processes:
+        lines.append(
+            f"  #{proc.rank} pid={proc.pid} cpu={proc.cpu_pct:.1f}% "
+            f"ram={proc.ram_mb:.0f}MB {proc.name}: {proc.cmdline}"
+        )
+    return "\n".join(lines)
+
+
+SPIKE_SHEET_COLUMNS = [
+    "spike_timestamp",
+    "system_cpu %",
+    "system_cores_above",
+    "rank",
+    "pid",
+    "name",
+    "cpu %",
+    "ram_mb",
+    "cmdline",
+]
+
+
+def append_spike_event_rows(
+    sheet,
+    event: CpuSpikeEvent,
+    *,
+    separator_before: bool = False,
+) -> None:
+    if separator_before:
+        sheet.append([None] * len(SPIKE_SHEET_COLUMNS))
+
+    if not event.top_processes:
+        sheet.append(
+            [
+                event.timestamp,
+                round(event.system_cpu_avg_pct, 2),
+                event.system_cores_above,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ]
+        )
+        return
+
+    for proc in event.top_processes:
+        sheet.append(
+            [
+                event.timestamp,
+                round(event.system_cpu_avg_pct, 2),
+                event.system_cores_above,
+                proc.rank,
+                proc.pid,
+                proc.name,
+                round(proc.cpu_pct, 2),
+                round(proc.ram_mb, 1),
+                proc.cmdline,
+            ]
+        )
+
+
 def format_elapsed_prefix(elapsed_s: float, duration_s: float) -> str:
     if duration_s > 0:
         return f"[{elapsed_s:.1f}/{duration_s:g}]"
@@ -421,18 +722,18 @@ def format_status_line(
     system_cores_col: str,
     target_processes: list[str],
 ) -> str:
-    gpu_pct = row["system_gpu_pct"]
+    gpu_pct = row["system_gpu %"]
     gpu_text = "n/a" if gpu_pct is None else f"{float(gpu_pct):.1f}"
     line = (
         f"{format_elapsed_prefix(elapsed_s, duration_s)} "
-        f"system_cpu={float(row['system_cpu_avg_pct']):.1f}% "
+        f"system_cpu={float(row['system_cpu %']):.1f}% "
         f"system_gpu={gpu_text}% "
         f"system_ram={float(row['system_ram_gb']):.3f}GB "
         f"{system_cores_col}={row[system_cores_col]}"
     )
     for name in target_processes:
         line += (
-            f" {name}_cpu={float(row[f'{name}_cpu_avg_pct']):.1f}%"
+            f" {name}_cpu={float(row[f'{name}_cpu %']):.1f}%"
             f" {name}_ram={float(row[f'{name}_ram_gb']):.3f}GB"
         )
     return line
@@ -500,6 +801,42 @@ def parse_args() -> argparse.Namespace:
             "Example: --target-processes micro_ros_agent monitor self"
         ),
     )
+    parser.add_argument(
+        "--spike-threshold",
+        type=float,
+        default=None,
+        help=(
+            "Enable spike capture when system_cpu >= this value (%%). "
+            "Omit this flag to disable spike capture entirely."
+        ),
+    )
+    parser.add_argument(
+        "--spike-top-n",
+        type=int,
+        default=DEFAULT_SPIKE_TOP_N,
+        help=(
+            "Number of top CPU processes to record per spike "
+            f"(default: {DEFAULT_SPIKE_TOP_N})"
+        ),
+    )
+    parser.add_argument(
+        "--spike-sample-s",
+        type=float,
+        default=DEFAULT_SPIKE_SAMPLE_S,
+        help=(
+            "CPU ranking window in seconds for spike snapshots "
+            f"(default: {DEFAULT_SPIKE_SAMPLE_S})"
+        ),
+    )
+    parser.add_argument(
+        "--spike-cooldown-s",
+        type=float,
+        default=DEFAULT_SPIKE_COOLDOWN_S,
+        help=(
+            "Minimum seconds between spike snapshots during sustained high CPU "
+            f"(default: {DEFAULT_SPIKE_COOLDOWN_S})"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -508,7 +845,7 @@ def round_cell(column: str, value: object) -> object:
         return value
     if value is None:
         return None
-    if column.endswith("_pct"):
+    if column.endswith(" %") or column.endswith("_AVERAGE"):
         return round(float(value), 2)
     if column.endswith("_gb"):
         return round(float(value), 3)
@@ -517,22 +854,40 @@ def round_cell(column: str, value: object) -> object:
     return value
 
 
+def compute_system_averages(rows: list[dict[str, object]]) -> tuple[float, float | None]:
+    cpu_avg = statistics.fmean(float(row["system_cpu %"]) for row in rows)
+    gpu_values = [
+        float(row["system_gpu %"])
+        for row in rows
+        if row["system_gpu %"] is not None
+    ]
+    gpu_avg = statistics.fmean(gpu_values) if gpu_values else None
+    return cpu_avg, gpu_avg
+
+
 def build_summary_row(columns: list[str], rows: list[dict[str, object]]) -> list[object]:
+    cpu_avg, gpu_avg = compute_system_averages(rows)
     summary: list[object] = []
     for column in columns:
         if column == "timestamp":
             summary.append("SUMMARY")
             continue
+        if column == "system_cpu_AVERAGE":
+            summary.append(round(cpu_avg, 2))
+            continue
+        if column == "system_gpu_AVERAGE":
+            summary.append(round(gpu_avg, 2) if gpu_avg is not None else None)
+            continue
 
         values = [row[column] for row in rows]
-        if column == "system_gpu_pct":
+        if column == "system_gpu %":
             gpu_values = [float(value) for value in values if value is not None]
             summary.append(
                 round(statistics.fmean(gpu_values), 2) if gpu_values else None
             )
         elif column.startswith("system_cores_above_"):
             summary.append(sum(int(value) for value in values))
-        elif column.endswith("_pct") or column.endswith("_gb"):
+        elif column.endswith(" %") or column.endswith("_gb"):
             summary.append(
                 round(statistics.fmean(float(value) for value in values), 3)
                 if column.endswith("_gb")
@@ -543,6 +898,35 @@ def build_summary_row(columns: list[str], rows: list[dict[str, object]]) -> list
     return summary
 
 
+def write_run_params_sheet(
+    workbook,
+    args: argparse.Namespace,
+    target_processes: list[str],
+    output_path: Path,
+    spike_enabled: bool,
+) -> None:
+    duration_text = "until Ctrl+C" if args.duration <= 0 else f"{args.duration:g}s"
+    params_sheet = workbook.create_sheet("run_params", 0)
+    params_sheet.append(["parameter", "value"])
+    params_sheet.append(["--hz", args.hz])
+    params_sheet.append(["--threshold", args.threshold])
+    params_sheet.append(["--duration", duration_text])
+    params_sheet.append(["--output", str(output_path)])
+    params_sheet.append(
+        [
+            "--target-processes",
+            ",".join(target_processes) if target_processes else "",
+        ]
+    )
+    params_sheet.append(
+        ["--spike-threshold", args.spike_threshold if spike_enabled else ""]
+    )
+    if spike_enabled:
+        params_sheet.append(["--spike-top-n", args.spike_top_n])
+        params_sheet.append(["--spike-sample-s", args.spike_sample_s])
+        params_sheet.append(["--spike-cooldown-s", args.spike_cooldown_s])
+
+
 def main() -> int:
     args = parse_args()
     if args.hz <= 0:
@@ -551,6 +935,21 @@ def main() -> int:
     if not 0 <= args.threshold <= 100:
         print("--threshold must be between 0 and 100", file=sys.stderr)
         return 1
+
+    spike_enabled = args.spike_threshold is not None
+    if spike_enabled:
+        if not 0 < args.spike_threshold <= 100:
+            print("--spike-threshold must be between 0 and 100 (exclusive of 0)", file=sys.stderr)
+            return 1
+        if args.spike_top_n < 0:
+            print("--spike-top-n must be >= 0", file=sys.stderr)
+            return 1
+        if args.spike_sample_s <= 0:
+            print("--spike-sample-s must be > 0", file=sys.stderr)
+            return 1
+        if args.spike_cooldown_s < 0:
+            print("--spike-cooldown-s must be >= 0", file=sys.stderr)
+            return 1
 
     target_processes = (
         normalize_target_processes(args.target_processes)
@@ -567,6 +966,14 @@ def main() -> int:
     cpu_baselines: dict[int, ProcessCpuBaseline] = {}
     pid_tracker = TargetPidTracker(target_processes)
     min_read_interval_s = interval * 0.75
+    spike_detector = CpuSpikeDetector(
+        threshold_pct=args.spike_threshold or 0.0,
+        top_n=args.spike_top_n,
+        sample_interval_s=args.spike_sample_s,
+        cooldown_s=args.spike_cooldown_s,
+        enabled=spike_enabled,
+    )
+    spike_events: list[CpuSpikeEvent] = []
 
     if gpu_load_path is None:
         print("Warning: GPU load sysfs not found; GPU column will be empty.", file=sys.stderr)
@@ -584,21 +991,14 @@ def main() -> int:
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "monitor"
-    duration_text = "until Ctrl+C" if args.duration <= 0 else f"{args.duration:g}s"
-    sheet.append(
-        [
-            "RUN_PARAMS",
-            f"--hz={args.hz:g}",
-            f"--threshold={args.threshold:g}",
-            f"duration={duration_text}",
-            (
-                "--target-processes=" + ",".join(target_processes)
-                if target_processes
-                else ""
-            ),
-        ]
+    write_run_params_sheet(
+        workbook, args, target_processes, output_path, spike_enabled
     )
     sheet.append(columns)
+    spike_sheet = None
+    if spike_detector.enabled:
+        spike_sheet = workbook.create_sheet("cpu_spikes")
+        spike_sheet.append(SPIKE_SHEET_COLUMNS)
 
     rows: list[dict[str, object]] = []
     start = time.monotonic()
@@ -646,6 +1046,13 @@ def main() -> int:
             "Process CPU scale: 0-100% = share of total system CPU "
             f"(cpu_times delta / elapsed / {get_cpu_count()} cores)."
         )
+    if spike_detector.enabled:
+        print(
+            f"CPU spike capture: threshold={args.spike_threshold:g}%%, "
+            f"top_n={args.spike_top_n}, sample={args.spike_sample_s:g}s, "
+            f"cooldown={args.spike_cooldown_s:g}s "
+            "(full process scan only on spike, not every tick)."
+        )
 
     try:
         while True:
@@ -662,8 +1069,8 @@ def main() -> int:
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
             row: dict[str, object] = {
                 "timestamp": timestamp,
-                "system_cpu_avg_pct": statistics.fmean(per_core) if per_core else 0.0,
-                "system_gpu_pct": read_gpu_percent(gpu_load_path),
+                "system_cpu %": statistics.fmean(per_core) if per_core else 0.0,
+                "system_gpu %": read_gpu_percent(gpu_load_path),
                 "system_ram_gb": get_system_ram_gb(),
                 system_cores_col: count_cores_above(per_core, args.threshold),
             }
@@ -681,8 +1088,24 @@ def main() -> int:
                 pid_tracker.invalidate()
             for name in target_processes:
                 cpu_pct, ram_gb = target_samples.get(name, (0.0, 0.0))
-                row[f"{name}_cpu_avg_pct"] = cpu_pct
+                row[f"{name}_cpu %"] = cpu_pct
                 row[f"{name}_ram_gb"] = ram_gb
+
+            spike_event = spike_detector.maybe_capture(
+                timestamp=timestamp,
+                system_cpu_avg_pct=float(row["system_cpu %"]),
+                system_cores_above=int(row[system_cores_col]),
+                now=now,
+            )
+            if spike_event is not None:
+                spike_events.append(spike_event)
+                print(f"\n{format_spike_event(spike_event)}", flush=True)
+                if spike_sheet is not None:
+                    append_spike_event_rows(
+                        spike_sheet,
+                        spike_event,
+                        separator_before=len(spike_events) > 1,
+                    )
 
             rows.append(row)
             sample_count += 1
@@ -701,33 +1124,37 @@ def main() -> int:
     else:
         print()
 
-    for row in rows:
-        sheet.append([round_cell(column, row[column]) for column in columns])
-
     if rows:
+        cpu_avg, gpu_avg = compute_system_averages(rows)
+        for row in rows:
+            row["system_cpu_AVERAGE"] = cpu_avg
+            row["system_gpu_AVERAGE"] = gpu_avg
+            sheet.append([round_cell(column, row[column]) for column in columns])
         sheet.append(build_summary_row(columns, rows))
 
     workbook.save(output_path)
     print(f"Saved {len(rows)} samples to {output_path}")
+    if spike_events:
+        print(f"Recorded {len(spike_events)} CPU spike snapshot(s).")
 
     if rows:
         summary_row = build_summary_row(columns, rows)
         summary_map = dict(zip(columns, summary_row))
         print(
             "Summary row: "
-            f"system_cpu_avg_pct={summary_map['system_cpu_avg_pct']}% "
+            f"system_cpu_avg_pct={summary_map['system_cpu %']}% "
             f"system_ram_gb={summary_map['system_ram_gb']} "
             f"{system_cores_col}={summary_map[system_cores_col]}"
         )
         for name in target_processes:
             print(
-                f"  {name}: cpu_avg_pct={summary_map[f'{name}_cpu_avg_pct']}% "
+                f"  {name}: cpu_avg_pct={summary_map[f'{name}_cpu %']}% "
                 f"ram_gb={summary_map[f'{name}_ram_gb']}"
             )
         gpu_values = [
-            float(row["system_gpu_pct"])
+            float(row["system_gpu %"])
             for row in rows
-            if row["system_gpu_pct"] is not None
+            if row["system_gpu %"] is not None
         ]
         if gpu_values:
             print(
